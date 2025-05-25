@@ -1,0 +1,6 @@
+__pycache__/
+__init__.py
+*.sh
+scripts/
+results*/
+.DS_Store

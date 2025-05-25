@@ -1,0 +1,10 @@
+# OpenAI API Key
+OPENAI_API_KEY = ""
+
+# AWS Configs
+AWS_ACCESS_KEY_ID = ""
+AWS_SECRET_ACCESS_KEY = ""
+AWS_REGION_NAME = ""
+
+# OpenRouter API Key
+OPENROUTER_API_KEY = ""
