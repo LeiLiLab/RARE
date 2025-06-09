@@ -25,9 +25,6 @@ from utils.prompts import (
     policy_triplets_prompt_user,
     policy_relation_similarity_prompt
 )
-from utils.api_keys import OPENAI_API_KEY
-
-os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 
 logging.basicConfig(filename='logs/kg_triplet_extraction.log', filemode='w', level=logging.INFO)
 litellm.global_disable_no_log_param = True
