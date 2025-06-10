@@ -17,9 +17,9 @@ from pathlib import Path
 from pydantic import BaseModel
 import ast
 
-# class CoTResponse(BaseModel):
-#     cot_answer: str
-#     answer: str
+class CoTResponse(BaseModel):
+    cot_answer: str
+    answer: str
 router = litellm.Router(model_list=MODEL_LIST, num_retries=3, retry_after=5)
 
 async def run_generation(
@@ -40,17 +40,24 @@ async def run_generation(
         messages=messages,
         temperature=0.0,
         max_tokens=1024,
-        # response_format=CoTResponse
+        extra_body={
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
+        response_format=CoTResponse
     )
     parsed: Dict[str, List[str]] = {m: [] for m in models}
     for req_row in raw_responses:
         for model_idx, response in enumerate(req_row):
             model = models[model_idx]
             try:
-                ans = response.choices[0].message.content
-                ans = ast.literal_eval(ans)
-                if isinstance(ans, dict) and "answer" in ans:
-                    parsed[model].append(ans["answer"])
+                if response != litellm.ContextWindowExceededError:
+                    ans = response.choices[0].message.content
+                    ans = ast.literal_eval(ans)
+                    if isinstance(ans, dict) and "answer" in ans:
+                        parsed[model].append(ans["answer"])
+                else:
+                    logging.error(f"Context window exceeded for model {model} with response: {response}")
+                    parsed[model].append("Context window exceeded")
             except Exception as e:
                 logging.error(f"Error during inference stage: {e}")
                 matched = re.search(r'"?answer"?\s*:\s*(.*)', ans)
