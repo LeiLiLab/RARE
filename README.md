@@ -1,4 +1,5 @@
 
+<h1 align="center">RARE: Retrieval-Awareness Robustness Evaluation</h1>
 <p align="center">
   <a href="https://arxiv.org/abs/2506.00789" style="text-decoration: none;">
     <img src="https://img.shields.io/badge/arXiv-2506.00789-B31B1B?style=flat-square&logo=arxiv" alt="arXiv">
@@ -17,3 +18,15 @@
 - ***RARE*-Met**: a comprehensive robustness evaluation metric for measuring RAG system performance under perturbations to queries, documents, and simulated real-world retrieval results.
 
 ## 📦  Installation
+
+Strongly recommend using miniconda:
+
+```bash
+conda create -n rare python=3.12
+```
+
+Install the necessary libraries:
+
+```bash
+git clone https://github.com/your-org/RARE.git && cd RARE
+```
