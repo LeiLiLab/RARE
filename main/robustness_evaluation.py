@@ -53,7 +53,7 @@ async def run_generation(
                     parsed[model].append(ans["answer"])
             except Exception as e:
                 logging.error(f"Error during inference stage: {e}")
-                matched = re.search(r'"answer"\s*:\s*(.*)', ans)
+                matched = re.search(r'"?answer"?\s*:\s*(.*)', ans)
                 try:
                     if matched:
                         logging.error(f"Match result: {matched.group(1).strip()}")
@@ -116,7 +116,7 @@ def evaluate_robustness(
             intermediate[model] = res
 
         # save to file
-        if batch_no % 100 == 0 or batch_no == len(work_items) // batch_size:
+        if batch_no % 10 == 0 or batch_no == len(work_items) // batch_size:
             interim_path = output_dir / f"{domain}_interim_results_batch_{batch_no}.json"
             with open(interim_path, "w", encoding="utf-8") as fp:
                 json.dump(intermediate, fp, indent=2)
