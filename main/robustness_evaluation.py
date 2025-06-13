@@ -17,9 +17,9 @@ from pathlib import Path
 from pydantic import BaseModel
 import ast
 
-class CoTResponse(BaseModel):
-    cot_answer: str
-    answer: str
+# class CoTResponse(BaseModel):
+#     cot_answer: str
+#     answer: str
 router = litellm.Router(model_list=MODEL_LIST, num_retries=3, retry_after=5)
 
 async def run_generation(
@@ -40,17 +40,17 @@ async def run_generation(
         messages=messages,
         temperature=0.0,
         max_tokens=1024,
-        extra_body={
-        "chat_template_kwargs": {"enable_thinking": False},
-    },
-        response_format=CoTResponse
+    #     extra_body={
+    #     "chat_template_kwargs": {"enable_thinking": False},
+    # },
+        # response_format=CoTResponse
     )
     parsed: Dict[str, List[str]] = {m: [] for m in models}
     for req_row in raw_responses:
         for model_idx, response in enumerate(req_row):
             model = models[model_idx]
             try:
-                if response != litellm.ContextWindowExceededError:
+                if not isinstance(response, litellm.ContextWindowExceededError):
                     ans = response.choices[0].message.content
                     ans = ast.literal_eval(ans)
                     if isinstance(ans, dict) and "answer" in ans:
@@ -83,11 +83,19 @@ def evaluate_robustness(
     output_dir: os.PathLike | str,
     domain: str,
     batch_size: int = 32,
+    resume_from_checkpoint: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """Compute robustness metrics and print cumulative results after each batch."""
-    # per‑model, in‑memory running storage
-    # variant: variant_type
-    # variant_doc: variant_type + doc_variant_type
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check for existing checkpoint
+    checkpoint_path = output_dir / f"{domain}_checkpoint.json"
+    start_batch = 0
+    loaded_checkpoint = False
+    
+    # Initialize model store
     model_store: Dict[str, Dict[str, Any]] = {m: {
         "all": [],
         "query": [],
@@ -95,12 +103,135 @@ def evaluate_robustness(
         "real": defaultdict(list),
         "variant": defaultdict(list),
         "variant_doc": defaultdict(list),
+        "response_details": [],
+        "response_by_doc_type": defaultdict(list),
+        "can_answer_without": defaultdict(bool),
     } for m in generation_models}
     
-    def _id_list_to_texts(ids: List[str], id2text: Dict[str, str]):
-        return [id2text[cid] for cid in ids if cid in id2text]
+    can_answer_without: Dict[str, Dict[str, bool]] = {m: defaultdict(bool) for m in generation_models}
     
-    def _dump_interim(batch_no: int):
+    # Load checkpoint if exists and resume is enabled
+    if resume_from_checkpoint and checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                checkpoint = json.load(f)
+            
+            # Validate checkpoint is for same models and domain
+            if (set(checkpoint['models']) == set(generation_models) and 
+                checkpoint['domain'] == domain):
+                
+                start_batch = checkpoint['last_completed_batch'] + 1
+                loaded_checkpoint = True
+                
+                # Restore model store state
+                for model in generation_models:
+                    if model in checkpoint['model_store']:
+                        store_data = checkpoint['model_store'][model]
+                        model_store[model]['all'] = store_data['all']
+                        model_store[model]['query'] = store_data['query']
+                        model_store[model]['doc'] = store_data['doc']
+                        model_store[model]['real'] = defaultdict(list, store_data['real'])
+                        model_store[model]['variant'] = defaultdict(list, store_data['variant'])
+                        model_store[model]['variant_doc'] = defaultdict(list, store_data['variant_doc'])
+                        model_store[model]['response_details'] = store_data['response_details']
+                        model_store[model]['response_by_doc_type'] = defaultdict(list, store_data['response_by_doc_type'])
+                        model_store[model]['can_answer_without'] = defaultdict(bool, store_data['can_answer_without'])
+                
+                # Restore can_answer_without
+                for model, mappings in checkpoint['can_answer_without'].items():
+                    can_answer_without[model] = defaultdict(bool, mappings)
+                
+                logging.info(f"Resumed from checkpoint at batch {start_batch}")
+                print(f"\n{'='*80}")
+                print(f"RESUMING from batch {start_batch} (already completed {start_batch} batches)")
+                print(f"{'='*80}\n")
+            else:
+                logging.warning("Checkpoint found but models or domain don't match, starting fresh")
+        except Exception as e:
+            logging.error(f"Error loading checkpoint: {e}, starting fresh")
+    
+    def _analyze_responses(model_store: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Analyze model response patterns"""
+        analysis = {}
+        
+        for model, store in model_store.items():
+            # Count response types by document variant
+            doc_type_stats = defaultdict(lambda: {
+                "total": 0, "robust": 0, "correct": 0, 
+                "no_info": 0, "incorrect": 0, "can_answer_without": 0
+            })
+            
+            # Analyze each response
+            for detail in store["response_details"]:
+                doc_type = detail["doc_variant_type"]
+                stats = doc_type_stats[doc_type]
+                stats["total"] += 1
+                
+                if detail["robust"]:
+                    stats["robust"] += 1
+                if detail["is_correct"]:
+                    stats["correct"] += 1
+                if detail["returns_no_info"]:
+                    stats["no_info"] += 1
+                if not detail["is_correct"] and not detail["returns_no_info"]:
+                    stats["incorrect"] += 1
+                if detail["can_answer_without"]:
+                    stats["can_answer_without"] += 1
+            
+            # Calculate rates
+            for doc_type, stats in doc_type_stats.items():
+                if stats["total"] > 0:
+                    stats["robustness_rate"] = stats["robust"] / stats["total"]
+                    stats["correct_rate"] = stats["correct"] / stats["total"]
+                    stats["no_info_rate"] = stats["no_info"] / stats["total"]
+                    stats["incorrect_rate"] = stats["incorrect"] / stats["total"]
+            
+            analysis[model] = {
+                "total_responses": len(store["response_details"]),
+                "overall_robustness": sum(store["all"]) / max(len(store["all"]), 1),
+                "by_doc_type": dict(doc_type_stats),
+                "parametric_knowledge_count": sum(store["can_answer_without"].values()),
+            }
+        
+        return analysis
+    
+    def _save_checkpoint(batch_no: int, work_items_total: int):
+        """Save checkpoint for resuming later"""
+        checkpoint_data = {
+            "domain": domain,
+            "models": generation_models,
+            "last_completed_batch": batch_no,
+            "total_work_items": work_items_total,
+            "batch_size": batch_size,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model_store": {},
+            "can_answer_without": {}
+        }
+        
+        # Convert model store to serializable format
+        for model, store in model_store.items():
+            checkpoint_data["model_store"][model] = {
+                "all": store["all"],
+                "query": store["query"],
+                "doc": store["doc"],
+                "real": dict(store["real"]),
+                "variant": dict(store["variant"]),
+                "variant_doc": dict(store["variant_doc"]),
+                "response_details": store["response_details"],
+                "response_by_doc_type": dict(store["response_by_doc_type"]),
+                "can_answer_without": dict(store["can_answer_without"])
+            }
+        
+        # Convert can_answer_without to serializable format
+        for model, mappings in can_answer_without.items():
+            checkpoint_data["can_answer_without"][model] = dict(mappings)
+        
+        with open(checkpoint_path, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        logging.info(f"Checkpoint saved at batch {batch_no}")
+    
+    def _dump_interim(batch_no: int, total_work_items: int):
         intermediate: Dict[str, Dict[str, float]] = {}
         for model, store in model_store.items():
             res: Dict[str, float] = {}
@@ -122,12 +253,44 @@ def evaluate_robustness(
                 res[f"variant_doc_{key}_robustness"] = sum(scores) / len(scores)
             intermediate[model] = res
 
-        # save to file
-        if batch_no % 10 == 0 or batch_no == len(work_items) // batch_size:
+        # Add response analysis to interim results
+        if batch_no % 10 == 0 or batch_no * batch_size >= total_work_items:
+            # Perform detailed analysis
+            response_analysis = _analyze_responses(model_store)
+            
+            # Save both metrics and analysis
+            interim_data = {
+                "metrics": intermediate,
+                "analysis": response_analysis,
+                "batch_info": {  # Add batch information
+                    "current_batch": batch_no,
+                    "batch_size": batch_size,
+                    "total_work_items": total_work_items,
+                    "progress": min(batch_no * batch_size, total_work_items) / total_work_items
+                }
+            }
+            
             interim_path = output_dir / f"{domain}_interim_results_batch_{batch_no}.json"
             with open(interim_path, "w", encoding="utf-8") as fp:
-                json.dump(intermediate, fp, indent=2)
-            logging.info("Interim results saved to %s", interim_path)
+                json.dump(interim_data, fp, indent=2)
+            logging.info("Interim results with analysis saved to %s", interim_path)
+            
+            # Save checkpoint after interim results
+            _save_checkpoint(batch_no, total_work_items)
+            
+            # Print analysis summary
+            print(f"\n--- RESPONSE ANALYSIS (Batch {batch_no}) for {domain} ---")
+            print(f"Progress: {min(batch_no * batch_size, total_work_items)}/{total_work_items} items processed")
+            for model, analysis in response_analysis.items():
+                ms = model.split("/")[-1]
+                print(f"\n{ms}:")
+                print(f"  Parametric knowledge instances: {analysis['parametric_knowledge_count']}")
+                print(f"  Response breakdown by document type:")
+                for doc_type, stats in analysis['by_doc_type'].items():
+                    if stats['total'] > 0:
+                        print(f"    {doc_type}:")
+                        print(f"      Robustness: {stats.get('robustness_rate', 0):.2%} ({stats['robust']}/{stats['total']})")
+                        print(f"      Correct: {stats.get('correct_rate', 0):.2%}, No info: {stats.get('no_info_rate', 0):.2%}, Incorrect: {stats.get('incorrect_rate', 0):.2%}")
 
         print(f"\n--- INTERIM RESULTS (Batch {batch_no}) for {domain} ---")
         for model, scores in intermediate.items():
@@ -151,10 +314,11 @@ def evaluate_robustness(
     with open(retrieval_results_file, "r", encoding="utf-8") as fp:
         retrieval_results: Dict[str, Any] = json.load(fp)
 
-    can_answer_without: Dict[str, Dict[str, bool]] = {m: defaultdict(bool) for m in generation_models}
-
     # 1. Build work items once – each (query variant x doc variant) pair
     work_items: List[Tuple[str, List[str], Dict[str, Any]]] = []
+    
+    def _id_list_to_texts(ids: List[str], id2text: Dict[str, str]):
+        return [id2text[cid] for cid in ids if cid in id2text]
 
     for rec in records:
         rid = str(rec.get("id", ""))
@@ -180,8 +344,6 @@ def evaluate_robustness(
                 real_docs[retriever][query_variant] = _id_list_to_texts(doc_ids, id2text)
 
         # Test whether the model can answer with no docs
-        # Second empty list is the empty context
-        # Empty retriever: because it's not a real-world retrieval
         work_items.append((rec["question"], [], {
             "record_id": rid,
             "answer": answer,
@@ -225,8 +387,6 @@ def evaluate_robustness(
             # Real‑world retrievals
             for retriever, query_variant_map in real_docs.items():
                 docs_here = query_variant_map[query_variant_name]
-                # Id comparison, not text comparison
-
                 work_items.append((query_variant_text, docs_here, {
                     "record_id": rid,
                     "answer": answer,
@@ -235,46 +395,82 @@ def evaluate_robustness(
                     "retriever": retriever,
                     "for_metric": True,
                 }))
-    # print()
-    # print(f"Number of combination: {len(work_items)}")
-    # for i in work_items[:32]:
-    #     print(i[2])
-    # exit()
-    # 2. Helper for printing + saving interim results
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Batched generation & metric accumulation
-    for batch_start in tqdm_auto(range(0, len(work_items), batch_size), desc="Batches"):
-        batch_no = batch_start // batch_size
+    # Show resume information if loaded from checkpoint
+    if loaded_checkpoint:
+        print(f"Total work items: {len(work_items)}")
+        print(f"Already processed: {min(start_batch * batch_size, len(work_items))} items")
+        print(f"Remaining: {max(0, len(work_items) - start_batch * batch_size)} items")
+
+    # 3. Batched generation & metric accumulation with enhanced tracking
+    total_batches = (len(work_items) + batch_size - 1) // batch_size
+    
+    # Adjust progress bar to start from checkpoint
+    for batch_idx in tqdm_auto(range(start_batch, total_batches), 
+                               initial=start_batch, 
+                               total=total_batches, 
+                               desc="Batches"):
+        batch_start = batch_idx * batch_size
         batch = work_items[batch_start : batch_start + batch_size]
+        
+        if not batch:
+            break
+            
         queries = [w[0] for w in batch]
         docs_list = [w[1] for w in batch]
         meta = [w[2] for w in batch]
 
         model2resp = asyncio.run(run_generation(queries, docs_list, generation_models, domain))
 
-        # Post‑process responses
+        # Post‑process responses with enhanced tracking
         for model, responses in model2resp.items():
             for resp, m in zip(responses, meta):
                 resp = str(resp).strip()
                 rid = m["record_id"]
 
-                # Check can the model answer with no docs?
+                # Check can the model answer with no docs
                 if m["doc_variant_type"] == "empty":
                     if not can_answer_without[model][rid]:
                         can_answer_without[model][rid] = answer_judger(resp, m["answer"])
+                    # Track in model store for analysis
+                    model_store[model]["can_answer_without"][rid] = can_answer_without[model][rid]
                     continue  # probe not counted in metrics
 
-                # Robustness evaluation
+                # Enhanced robustness evaluation with tracking
+                is_correct = answer_judger(resp, m["answer"])
+                
+                # More flexible no info detection
+                no_info_phrases = [
+                    "no such info", "cannot find", "not available", "not found",
+                    "no information", "unable to answer", "don't have that information",
+                    "not provided", "not in the context"
+                ]
+                resp_lower = resp.lower()
+                returns_no_info = any(phrase in resp_lower for phrase in no_info_phrases)
+                
                 robust = robust_judger(
                     prediction=resp,
                     truth=m["answer"],
                     can_answer_without_retrieval=can_answer_without[model][rid],
                     doc_variant_type=m["doc_variant_type"]
                 )
-
+                
+                # Store detailed response information
+                response_detail = {
+                    "record_id": rid,
+                    "query_variant": m["query_variant_type"],
+                    "doc_variant_type": m["doc_variant_type"],
+                    "robust": robust,
+                    "is_correct": is_correct,
+                    "returns_no_info": returns_no_info,
+                    "can_answer_without": can_answer_without[model][rid],
+                    "response_preview": resp[:100] + "..." if len(resp) > 100 else resp
+                }
+                
                 st = model_store[model]
+                st["response_details"].append(response_detail)
+                st["response_by_doc_type"][m["doc_variant_type"]].append(response_detail)
+                
                 st["all"].append(robust)
                 st["variant"][m["query_variant_type"]].append(robust)
                 st["variant_doc"][f"{m['query_variant_type']}_{m['doc_variant_type']}"].append(robust)
@@ -291,17 +487,61 @@ def evaluate_robustness(
                 # Real‑world retrievals robustness
                 if m["query_variant_type"] == "original" and m["doc_variant_type"] == "real-world-docs":
                     st["real"][m["retriever"]].append(robust)
+                
+                # Log detailed information for debugging (only first batch after resume)
+                if batch_idx == start_batch and len(st["response_details"]) <= 10:
+                    logging.info(f"Model: {model.split('/')[-1]}, Doc type: {m['doc_variant_type']}, "
+                               f"Query variant: {m['query_variant_type']}, "
+                               f"Correct: {is_correct}, No info: {returns_no_info}, "
+                               f"Can answer without: {can_answer_without[model][rid]}, "
+                               f"Robust: {robust}")
 
         # After every batch — print & persist cumulative statistics
-        _dump_interim(batch_no)
+        _dump_interim(batch_idx, len(work_items))
 
-    # 4. Final aggregation 
-    _dump_interim(batch_no + 1)
-
-    # Read back the final snapshot as the return value
-    final_path = output_dir / f"{domain}_interim_results_batch_{batch_no + 1}.json"
+    # 4. Final aggregation with complete analysis
+    final_batch = batch_idx
+    _dump_interim(final_batch, len(work_items))
+    
+    # Generate final analysis report
+    final_analysis = _analyze_responses(model_store)
+    
+    # Save comprehensive final report
+    final_report = {
+        "metrics": {},
+        "analysis": final_analysis,
+        "summary": {
+            "domain": domain,
+            "total_records": len(records),
+            "total_work_items": len(work_items),
+            "models_evaluated": list(generation_models),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "resumed_from_checkpoint": loaded_checkpoint,
+            "final_batch": final_batch
+        }
+    }
+    
+    # Read back the final metrics
+    final_path = output_dir / f"{domain}_interim_results_batch_{final_batch}.json"
     with open(final_path, "r", encoding="utf-8") as fp:
-        return json.load(fp)
+        final_data = json.load(fp)
+        if isinstance(final_data, dict) and "metrics" in final_data:
+            final_report["metrics"] = final_data["metrics"]
+        else:
+            # Handle old format
+            final_report["metrics"] = final_data
+    
+    # Save final comprehensive report
+    report_path = output_dir / f"{domain}_final_report.json"
+    with open(report_path, "w", encoding="utf-8") as fp:
+        json.dump(final_report, fp, indent=2)
+    
+    # Clean up checkpoint file after successful completion
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        logging.info("Checkpoint file removed after successful completion")
+    
+    return final_report["metrics"]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate RAG robustness (generation phase)')
@@ -314,6 +554,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=100, help='Batch size for processing (higher uses more memory but is faster)')
     parser.add_argument('--log_level', type=str, default='ERROR', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
                       help='Logging level')
+    parser.add_argument('--no_resume', action='store_true', 
+                      help='Do not resume from checkpoint, start fresh even if checkpoint exists')
     args = parser.parse_args()
     
     # Set up logging
@@ -410,6 +652,7 @@ if __name__ == '__main__':
                 args.output_dir,
                 domain,
                 args.batch_size,
+                resume_from_checkpoint=not args.no_resume
             )
             
             # Save results

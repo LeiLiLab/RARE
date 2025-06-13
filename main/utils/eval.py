@@ -4,6 +4,7 @@ from utils.prompts import rag_prompt_system, rag_prompt_user
 from utils.litellm_router_models import MODEL_LIST
 import litellm
 import numpy as np
+import re
 
 EMBEDDING_MODEL_NAME = 'intfloat/e5-mistral-7b-instruct'
 
@@ -21,7 +22,7 @@ def get_embedding(prediction, truth):
     """
     try:
         # Format the prompt for e5-mistral-7b-instruct model
-        formatted_prediction = f"Text: {prediction}\nInstruct: Retrieve semantically similar text.\nQuery: "
+        formatted_prediction = f"Instruct: Check prediction has the semantic similar meaning compared with the ground truth answer.\nPrediction: {prediction}"
         
         # Get embedding using the vLLM API via OpenAI client
         response = router.embedding(
@@ -46,8 +47,8 @@ def answer_judger(pred: str, truth: str, threshold=0.9) -> bool:
     Judge if the prediction matches the ground truth answer.
     Returns True if the prediction is correct, False otherwise.
     """
-    norm_p = pred.lower().strip()
-    norm_t = truth.lower().strip()
+    norm_p = _normalize(pred)
+    norm_t = _normalize(truth)
     
     # Direct string match
     if (norm_t in norm_p or norm_p in norm_t) or (norm_t == norm_p):
@@ -60,14 +61,25 @@ def answer_judger(pred: str, truth: str, threshold=0.9) -> bool:
         if embed_p is not None and embed_t is not None:
             # Compute cosine similarity
             similarity = np.dot(embed_p, embed_t)
-            if similarity > threshold:
+            if similarity >= threshold:
                 # print(f"similarity: {similarity}")
                 return True
             
             return False
     except Exception as e:
         logging.warning(f"Error using vLLM embeddings: {e}")
+    
+    return False 
 
+def _normalize(text: str) -> str:
+    """
+    - lowercase
+    - strip most punctuation (keep % and . for numbers / decimals)
+    - collapse consecutive whitespace
+    """
+    text = text.lower()
+    text = re.sub(r"[^0-9a-z%.\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 def retrieval_judger(retrieval_docs: List[str], answer_chunk_ids: List[str]) -> bool:
     """
@@ -99,26 +111,31 @@ def robust_judger(
         bool: True if robust, False otherwise
     """
     is_correct = answer_judger(prediction, truth)
-    returns_no_info = "no such info" in prediction.lower()
+    no_info_phrases = [
+                    "no such info", "cannot find", "not available", "not found",
+                    "no information", "unable to answer", "don't have that information",
+                    "not provided", "not in the context"
+                ]
+    prediction = prediction.lower()
+    returns_no_info = any(phrase in prediction for phrase in no_info_phrases)
 
     # Top priority rule: If the model has parametric knowledge,
     # it must always be correct, regardless of context.
     if can_answer_without_retrieval:
-        return 1.0 if is_correct else 0.0
-
+        return is_correct
 
     if doc_variant_type in ['ground-truth-docs', 'lexical-diff-with-answer-docs']:
         # With perfect context provided, the model must be correct.
-        return 1.0 if is_correct else 0.0
+        return is_correct
 
     elif doc_variant_type == 'lexical-similar-no-answer-docs':
         # With misleading context that contains no answer, the model must refuse.
-        return 1.0 if returns_no_info else 0.0
+        return returns_no_info
 
     elif doc_variant_type == 'real-world-docs':
-        return 1.0 if is_correct or returns_no_info else 0.0
+        return is_correct or returns_no_info
     # Default case for any other variant types
-    return 0.0
+    return False
 
 # Prepare a batch of prompts for generation
 def prepare_batch_prompts(
