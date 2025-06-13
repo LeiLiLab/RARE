@@ -64,8 +64,8 @@ def answer_judger(pred: str, truth: str, threshold=0.9) -> bool:
             if similarity >= threshold:
                 # print(f"similarity: {similarity}")
                 return True
-            
-            return False
+            else:
+                return False
     except Exception as e:
         logging.warning(f"Error using vLLM embeddings: {e}")
     
@@ -80,6 +80,19 @@ def _normalize(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^0-9a-z%.\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+def is_refusal(pred: str) -> bool:
+    """
+    Check if the prediction is a refusal.
+    A refusal is defined as a prediction that does not provide an answer.
+    """
+    refusal_phrases = [
+        "no such info", "cannot find", "not available", "not found",
+        "no information", "unable to answer", "don't have that information",
+        "not provided", "not in the context"
+    ]
+    pred_lower = _normalize(pred)
+    return any(phrase in pred_lower for phrase in refusal_phrases)
 
 def retrieval_judger(retrieval_docs: List[str], answer_chunk_ids: List[str]) -> bool:
     """
@@ -111,13 +124,7 @@ def robust_judger(
         bool: True if robust, False otherwise
     """
     is_correct = answer_judger(prediction, truth)
-    no_info_phrases = [
-                    "no such info", "cannot find", "not available", "not found",
-                    "no information", "unable to answer", "don't have that information",
-                    "not provided", "not in the context"
-                ]
-    prediction = prediction.lower()
-    returns_no_info = any(phrase in prediction for phrase in no_info_phrases)
+    returns_no_info = (not is_correct) and is_refusal(prediction)
 
     # Top priority rule: If the model has parametric knowledge,
     # it must always be correct, regardless of context.

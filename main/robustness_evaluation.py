@@ -7,7 +7,7 @@ import time
 from typing import List, Dict, Any, Tuple
 from tqdm.auto import tqdm as tqdm_auto
 from rag_pipeline import load_chunks
-from utils.eval import answer_judger, robust_judger, prepare_batch_prompts
+from utils.eval import answer_judger, robust_judger, prepare_batch_prompts, is_refusal
 from utils.litellm_router_models import MODEL_LIST
 import sys
 import litellm
@@ -438,15 +438,7 @@ def evaluate_robustness(
 
                 # Enhanced robustness evaluation with tracking
                 is_correct = answer_judger(resp, m["answer"])
-                
-                # More flexible no info detection
-                no_info_phrases = [
-                    "no such info", "cannot find", "not available", "not found",
-                    "no information", "unable to answer", "don't have that information",
-                    "not provided", "not in the context"
-                ]
-                resp_lower = resp.lower()
-                returns_no_info = any(phrase in resp_lower for phrase in no_info_phrases)
+                returns_no_info = (not is_correct) and is_refusal(resp)
                 
                 robust = robust_judger(
                     prediction=resp,
