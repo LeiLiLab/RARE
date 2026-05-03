@@ -42,6 +42,7 @@ class Retriever:
         self.reranker_model = reranker_model
         self.index_dir = index_dir
 
+        # Initialize embedding and reranker
         self.embedding = HuggingFaceEmbeddings(model_name=self.embedding_model, 
                                                encode_kwargs={'prompt': "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"},
                                                model_kwargs={"trust_remote_code": True})
@@ -73,9 +74,12 @@ class Retriever:
         """
         Retrieve top documents by embedding search, then rerank with cross-encoder.
         """
+        # First-stage retrieval
         docs = self.retriever.invoke(query)
+        # Reranking
         pairs = [(query, d.page_content) for d in docs]
         scores = self.reranker.predict(pairs, show_progress_bar=False)
+        # Sort by cross-encoder score
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in ranked[:k_retrank]]
     
@@ -93,10 +97,12 @@ class Retriever:
         """
         results = {}
         
+        # First-stage retrieval for all queries
         all_docs = {}
         for query in tqdm(queries):
             all_docs[query] = self.retriever.invoke(query)
         
+        # Prepare all pairs for reranking
         all_pairs = []
         query_to_pair_indices = {}
         
@@ -106,12 +112,14 @@ class Retriever:
             all_pairs.extend(pairs)
             query_to_pair_indices[query] = (start_idx, start_idx + len(pairs), docs)
         
+        # Process reranking in batches
         all_scores = []
         for i in range(0, len(all_pairs), batch_size):
             batch_pairs = all_pairs[i:i+batch_size]
             batch_scores = self.reranker.predict(batch_pairs, show_progress_bar=False)
             all_scores.extend(batch_scores)
         
+        # Sort and return results for each query
         for query, (start_idx, end_idx, docs) in query_to_pair_indices.items():
             query_scores = all_scores[start_idx:end_idx]
             ranked = sorted(zip(query_scores, docs), key=lambda x: x[0], reverse=True)
@@ -120,7 +128,9 @@ class Retriever:
         return results
     
     def unload(self):
+        # remove the embedding wrapper
         if hasattr(self, "embedding") and self.embedding is not None:
+            # delete the pipeline/model and tokenizer inside it:
             if hasattr(self.embedding, "client"):
                 try:
                     del self.embedding.client.model
@@ -129,6 +139,7 @@ class Retriever:
                     pass
             del self.embedding
 
+        # remove the CrossEncoder internals
         if hasattr(self, "reranker") and self.reranker is not None:
             try:
                 del self.reranker.model
@@ -137,11 +148,13 @@ class Retriever:
                 pass
             del self.reranker
 
+        # drop FAISS index
         if hasattr(self, "index") and self.index is not None:
             del self.index
 
         self.retriever = None
 
+        # force a GC and clear CUDA cache
         import gc
         gc.collect()
         if torch.cuda.is_available():

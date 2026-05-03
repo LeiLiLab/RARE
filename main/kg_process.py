@@ -456,3 +456,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+'''
+python kg_process.py --output_dir /data/group_data/rag-robust-eval/data/policy \
+    --domain policy --chunks_dir /data/group_data/rag-robust-eval/data/policy/chunks \
+    --relations_file /data/group_data/rag-robust-eval/data/policy/relationship.json \
+    --triplets_file /data/group_data/rag-robust-eval/data/policy/triplets.json \
+    --sample_size 25
+'''

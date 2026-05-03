@@ -1,85 +1,166 @@
 import logging
-from typing import List, Dict, Any, Tuple
+import asyncio
+from typing import List, Dict, Any, Tuple, Union
 from utils.prompts import rag_prompt_system, rag_prompt_user
 from utils.litellm_router_models import MODEL_LIST
 import litellm
 import numpy as np
 import re
+import random
+import os
+# litellm._turn_on_debug()
 
-EMBEDDING_MODEL_NAME = 'intfloat/e5-mistral-7b-instruct'
+LLM_MODEL_NAME = "bedrock/us.anthropic.claude-3-haiku-20240307-v1:0"
+
+random.seed(42)
+
+# Single shared event loop for ALL LiteLLM async calls (precedes router creation)
+EVENT_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(EVENT_LOOP)
+
+def get_shared_loop():
+    """Expose the single shared event loop to other modules."""
+    return EVENT_LOOP
 
 router = litellm.Router(model_list=MODEL_LIST, num_retries=3, retry_after=5)
 
-def get_embedding(prediction, truth):
-    """
-    Get embedding from vLLM-deployed model.
-    
-    Args:
-        text: Text to embed
-        
-    Returns:
-        Embedding vector
-    """
-    try:
-        # Format the prompt for e5-mistral-7b-instruct model
-        formatted_prediction = f"Instruct: Check prediction has the semantic similar meaning compared with the ground truth answer.\nPrediction: {prediction}"
-        
-        # Get embedding using the vLLM API via OpenAI client
-        response = router.embedding(
-            model=EMBEDDING_MODEL_NAME,
-            input=[
-                formatted_prediction,
-                truth
-            ],
-            encoding_format="float"
-        )
-        
-        # Extract embedding from response
-        embedding_prediction = response.data[0]['embedding']
-        embedding_truth = response.data[1]['embedding']
-        return embedding_prediction, embedding_truth
-    except Exception as e:
-        logging.error(f"Error getting embedding from vLLM: {e}")
-        return None
-
-def answer_judger(pred: str, truth: str, threshold=0.9) -> bool:
-    """
-    Judge if the prediction matches the ground truth answer.
-    Returns True if the prediction is correct, False otherwise.
-    """
-    norm_p = _normalize(pred)
-    norm_t = _normalize(truth)
-    
-    # Direct string match
-    if (norm_t in norm_p or norm_p in norm_t) or (norm_t == norm_p):
-        return True
-    
-    try:
-        # Try to get embeddings from vLLM
-        embed_p, embed_t = get_embedding(norm_p, norm_t)
-        
-        if embed_p is not None and embed_t is not None:
-            # Compute cosine similarity
-            similarity = np.dot(embed_p, embed_t)
-            if similarity >= threshold:
-                # print(f"similarity: {similarity}")
-                return True
-            else:
-                return False
-    except Exception as e:
-        logging.warning(f"Error using vLLM embeddings: {e}")
-    
-    return False 
-
 def _normalize(text: str) -> str:
     """
-    - lowercase
-    - strip most punctuation (keep % and . for numbers / decimals)
-    - collapse consecutive whitespace
+        - lowercase
+        - strip most punctuation (keep % and . for numbers / decimals)
+        - collapse consecutive whitespace
     """
+    # 1. lowercase
     text = text.lower()
-    text = re.sub(r"[^0-9a-z%.\s]", " ", text)
+    # 2. drop a leading $ that immediately precedes digits (currency symbol)
+    text = re.sub(r"\$(?=\d)", "", text)
+    # 3. drop commas NOT between digits – keeps numeric grouping commas only
+    text = re.sub(r"(?<!\d),(?!\d)", " ", text)
+    # 4. strip unwanted punctuation but keep numerically‐useful symbols
+    text = re.sub(r"[^0-9a-z%.,\s]", " ", text)
+    # 5. collapse consecutive whitespace and trim
     return re.sub(r"\s+", " ", text).strip()
+
+def answer_judger(pred: Union[str, List[str]], truth: Union[str, List[str]]):
+    """
+        Return True/False if pred semantically matches ground truth.
+        Now supports single input OR batched inputs.
+        - If `pred` and `truth` are strings -> returns bool.
+        - If both are lists of equal length -> returns List[bool].
+
+        Internally uses `router.abatch_completion` for LLM judging on a shared event loop.
+    """
+    system_prompt = """
+You are a fair and strict judger, given prediction and ground truth, your task is to determine if the prediction has the same/highly similar meaning as the ground truth answer. 
+Return true if:
+- The prediction and ground truth are semantically identical or highly similar.
+- The prediction provides the same information as the ground truth.
+- If ground truth is included in the prediction consider it a match.
+    -  Which means if prediction not only contains the ground truth, but also contains other information, it should be considered a match.
+    -  Example: prediction: "The company's revenue was $50 million in 2023" and ground truth: "$50 million" are considered the same.
+Return false if:
+- The prediction does not match the ground truth in meaning.
+- The prediction is a refusal or does not provide an answer.
+- The ground truth has more specific information than the prediction.
+- If the prediction is a numeric value, it should match the ground truth numerically
+    - Example #1: 120,000,000 and 120000000 are considered the same.
+    - Example #2: 120,000,000 and 120 billion are considered the same.
+
+For your output, you should only answer 'true' or 'false', no extra text.
+Examples:
+1. Prediction: "The company's revenue was $50 million in 2023", Ground Truth: "$50 million", Output: true
+2. Prediction: "Apple Inc.", Ground Truth: "Apple", Output: true
+3. Prediction: "I cannot find that information", Ground Truth: "25%", Output: false
+4. Prediction: "The answer is 42", Ground Truth: "42", Output: true
+5. Prediction: "The population is around 1 million", Ground Truth: "1,000,000", Output: true
+6. Prediction: "Tesla", Ground Truth: "General Motors", Output: false
+"""
+    # Normalize and shape inputs
+    is_batch = isinstance(pred, list) and isinstance(truth, list)
+    preds = pred if isinstance(pred, list) else [pred]
+    truths = truth if isinstance(truth, list) else [truth]
+
+    if len(preds) != len(truths):
+        raise ValueError("For batched judging, `pred` and `truth` lists must be the same length.")
+
+    norm_ps = [_normalize(p) for p in preds]
+    norm_ts = [_normalize(t) for t in truths]
+
+    # Quick-path heuristics & refusal detection
+    results: List[Union[bool, None]] = [None] * len(norm_ps)
+    to_judge_indices: List[int] = []
+    messages: List[List[Dict[str, str]]] = []
+
+    for i, (norm_p, norm_t) in enumerate(zip(norm_ps, norm_ts)):
+        if is_refusal(norm_p):
+            results[i] = False
+            continue
+
+        if (norm_t in norm_p or norm_p in norm_t) or (norm_t == norm_p):
+            results[i] = True
+            continue
+
+        # Needs LLM judgment
+        to_judge_indices.append(i)
+        messages.append([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Prediction: {norm_p}\nGround Truth: {norm_t}\nOutput:"},
+        ])
+
+    # If nothing needs LLM judging, return early
+    if not messages:
+        return results[0] if not is_batch else results  # type: ignore[return-value]
+
+    # LLM batch call via abatch_completion on the shared loop
+    try:
+        async def _run_batch():
+            return await router.abatch_completion(
+                models=[LLM_MODEL_NAME],
+                messages=messages,
+                temperature=0.0,
+                max_tokens=50,
+            )
+
+        raw_responses = EVENT_LOOP.run_until_complete(_run_batch())
+
+        # raw_responses: list over requests; each item is a list over models
+        for req_idx, req_row in enumerate(raw_responses):
+            try:
+                response = req_row[0]  # single model used
+                msg = response.choices[0].message
+                content_str = getattr(msg, "content", "")
+                # Prefer explicit boolean token; fall back to parsed object; else False
+                judged_true = False
+                text = str(content_str).strip().lower()
+                if "true" in text and "false" not in text:
+                    judged_true = True
+                elif "false" in text and "true" not in text:
+                    judged_true = False
+                else:
+                    parsed_obj = getattr(msg, "parsed", None)
+                    if isinstance(parsed_obj, dict) and "result" in parsed_obj:
+                        judged_true = bool(parsed_obj["result"])
+
+                idx = to_judge_indices[req_idx]
+                results[idx] = judged_true
+
+                # logging.error(
+                #     f"LLM judger result: {judged_true}, prediction: {norm_ps[idx]}, truth: {norm_ts[idx]}"
+                # )
+            except Exception as inner_e:
+                idx = to_judge_indices[req_idx]
+                results[idx] = False
+                logging.warning(f"Error parsing LLM judger response at index {idx}: {inner_e}")
+
+    except Exception as e:
+        logging.warning(f"Error using LLM batch judging: {e}")
+        # Any unresolved items default to False
+        for idx in to_judge_indices:
+            if results[idx] is None:
+                results[idx] = False
+
+    # Return shape consistent with input
+    return results[0] if not is_batch else results  # type: ignore[return-value]
 
 def is_refusal(pred: str) -> bool:
     """
@@ -94,55 +175,51 @@ def is_refusal(pred: str) -> bool:
     pred_lower = _normalize(pred)
     return any(phrase in pred_lower for phrase in refusal_phrases)
 
-def retrieval_judger(retrieval_docs: List[str], answer_chunk_ids: List[str]) -> bool:
-    """
-    Judge if the retrieval contains the ground truth answer chunks.
-    Returns True if any of the ground truth answer chunks are in the retrieval, False otherwise.
-    
-    Args:
-        retrieval_docs: List of retrieved documents
-        answer_chunk_ids: List of chunk IDs that contain the answer
-    """
-    # As long as one of the answer chunk IDs is in the retrieval, return True
-    return bool(set(retrieval_docs) & set(answer_chunk_ids))
-
 def robust_judger(
-    prediction: str,
-    truth: str,
-    can_answer_without_retrieval: bool,
-    doc_variant_type: str,
-) -> bool:
+    prediction: Union[str, List[str]],
+    truth: Union[str, List[str]],
+    can_answer_without_retrieval: Union[bool, List[bool]],
+    doc_variant_type: Union[str, List[str]],
+) -> Union[bool, List[bool]]:
     """
-    Binary robustness judger 
-    Args:
-        prediction: Model's prediction
-        truth: Ground truth answer
-        can_answer_without_retrieval: Whether model can answer without retrieval
-        doc_variant_type: Type of document variant
-    
+    Binary robustness judger (now supports batch).
+    Inputs can be scalars or lists of equal length.
     Returns:
-        bool: True if robust, False otherwise
+        bool or List[bool]: robust flags
     """
-    is_correct = answer_judger(prediction, truth)
-    returns_no_info = (not is_correct) and is_refusal(prediction)
+    # Harmonize to lists
+    preds = prediction if isinstance(prediction, list) else [prediction]
+    truths = truth if isinstance(truth, list) else [truth]
+    cans  = can_answer_without_retrieval if isinstance(can_answer_without_retrieval, list) else [can_answer_without_retrieval] * len(preds)
+    docts = doc_variant_type if isinstance(doc_variant_type, list) else [doc_variant_type] * len(preds)
 
-    # Top priority rule: If the model has parametric knowledge,
-    # it must always be correct, regardless of context.
-    if can_answer_without_retrieval:
-        return is_correct
+    if not (len(preds) == len(truths) == len(cans) == len(docts)):
+        raise ValueError("Batched robust_judger inputs must have equal lengths.")
 
-    if doc_variant_type in ['ground-truth-docs', 'lexical-diff-with-answer-docs']:
-        # With perfect context provided, the model must be correct.
-        return is_correct
+    # Correctness via (batched) answer_judger
+    is_correct_list = answer_judger(preds, truths)
+    if not isinstance(is_correct_list, list):
+        is_correct_list = [is_correct_list]
 
-    elif doc_variant_type == 'lexical-similar-no-answer-docs':
-        # With misleading context that contains no answer, the model must refuse.
-        return returns_no_info
+    results: List[bool] = []
+    for p, is_corr, can_ans, dvt in zip(preds, is_correct_list, cans, docts):
+        returns_no_info = (not is_corr) and is_refusal(str(p))
+        # Robustness rules by doc variant type
+        if dvt in ['ground-truth-docs', 'lexical-diff-with-answer-docs']:
+            # Must be correct when docs contain the answer
+            results.append(bool(is_corr))
+        elif dvt == 'lexical-similar-no-answer-docs':
+            results.append(bool(returns_no_info or (can_ans and is_corr)))
+        elif dvt == 'real-world-docs':
+            # Accept either correct answer or safe abstention
+            results.append(bool(is_corr or returns_no_info))
+        else:
+            results.append(False)
 
-    elif doc_variant_type == 'real-world-docs':
-        return is_correct or returns_no_info
-    # Default case for any other variant types
-    return False
+    # Return scalar if scalar input
+    if not isinstance(prediction, list) and not isinstance(truth, list):
+        return results[0]
+    return results
 
 # Prepare a batch of prompts for generation
 def prepare_batch_prompts(

@@ -26,6 +26,7 @@ class Logger:
         os.makedirs(f"{DATASET_DIR}/logs", exist_ok=True)
 
         # Configure what is getting logged to the *.log file
+        # We want to capture everything (i.e., DEBUG, INFO, WARNING, ERROR, CRITICAL messages)
         logging.basicConfig(
             level=logging.DEBUG,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -38,7 +39,7 @@ class Logger:
         console = logging.StreamHandler()
         console.setLevel(
             logging.INFO
-        )
+        )  # This logs INFO, WARNING, ERROR, CRITICAL messages to the console.
 
         # Set a format which is simpler for console use
         formatter = logging.Formatter("%(message)s")

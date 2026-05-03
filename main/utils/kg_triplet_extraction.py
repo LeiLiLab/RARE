@@ -25,6 +25,8 @@ from utils.prompts import (
     policy_triplets_prompt_user,
     policy_relation_similarity_prompt
 )
+from utils.api_keys import OPENAI_API_KEY
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 logging.basicConfig(filename='logs/kg_triplet_extraction.log', filemode='w', level=logging.INFO)
 litellm.global_disable_no_log_param = True
@@ -62,7 +64,7 @@ class BaseTripletExtractor(ABC):
         self.relation_embeddings = None
         
     def load_relations(self, relations_file: str) -> None:
-        """Load existing relations from file"""
+        """Load existing relations from file using pandas"""
         if os.path.exists(relations_file):
             try:
                 df = pd.read_json(relations_file)
@@ -76,7 +78,7 @@ class BaseTripletExtractor(ABC):
                 self.relation_data = {"relations": []}
     
     def save_relations(self, relations_file: str) -> None:
-        """Save relations to file"""
+        """Save relations to file using pandas"""
         try:
             df = pd.DataFrame(self.relation_data)
             df.to_json(relations_file, orient='columns', indent=2)
